@@ -1,21 +1,28 @@
 """Manager: controls the DHT manager, which handles all queries to the distributed hash table."""
 
 from dataclasses import dataclass
+from math import e
 import socket
 from enum import Enum
 from log import logger
+import json
+import random
+import sys
 
-
-class State(Enum):
+class PeerState(Enum):
     FREE = 0 #  a peer able to participate in any capacity
     LEADER = 1 #  a peer that leads the construction of the DHT
     INDHT = 2 # a peer that is one of the members of the DHT.
     
+class DHTState(Enum):
+    UNINIT = 0
+    CONSTRUCTING = 1
+    COMPLETE = 2
     
 class returnCodes(Enum):
-    FAILURE = b'FAILURE'
-    SUCCESS = b'SUCCESS'
-    INVALID = b'INVALID'
+    FAILURE = 'FAILURE'
+    SUCCESS = 'SUCCESS'
+    INVALID = 'INVALID'
     
 @dataclass
 class Peer:
@@ -23,17 +30,19 @@ class Peer:
     address: str
     m_port: str
     p_port: str
-    state: State
+    state: PeerState
+    id: int
 
 peers: dict[str, Peer] = {}
-PORT = 1500
+dhtpeers = []
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
 IP = "127.0.0.1"
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((IP, PORT))
 
 running = True
-dht_constructed = False
+state = {'dht': DHTState.UNINIT}
 
 logger.info("Server running at %s:%s", IP, PORT)
 
@@ -51,9 +60,9 @@ def registerPeer(name, ip, mport, pport):
     """ 
     logger.info("")
     if name in peers:
-        return returnCodes.FAILURE
-    peers[name] = Peer(name, ip, mport, pport, State.FREE)
-    return returnCodes.SUCCESS
+        return {'status' : returnCodes.FAILURE.value}
+    peers[name] = Peer(name, ip, mport, pport, PeerState.FREE, -1)
+    return {'status' : returnCodes.SUCCESS.value}
     
 def setup_dht(name : str, size : int, year : str):
     """
@@ -66,9 +75,23 @@ def setup_dht(name : str, size : int, year : str):
     :returns: whether or not this construction can start.
     """
         
-    if dht_constructed or name not in peers or size < 3 or len(peers) < size:
-        return returnCodes.FAILURE
-    return returnCodes.SUCCESS
+    if state['dht'] != DHTState.UNINIT or name not in peers or size < 3 or len(peers) < size:
+        return {'status' : returnCodes.FAILURE.value}
+
+    leader = peers[name]
+    peers[name].state = PeerState.LEADER 
+    peers[name].id = 0
+    dhtpeers.append((leader.name, leader.address, leader.p_port))
+
+    unselected_peers = random.sample([peer for peer in peers.values() if peer.name != name], size-1)
+    for i, peer in enumerate(unselected_peers):
+        peer.state = PeerState.INDHT
+        peer.id = i + 1
+
+        dhtpeers.append((peer.name, peer.address, peer.p_port))
+    
+    state['dht'] = DHTState.CONSTRUCTING
+    return{'status' : returnCodes.SUCCESS.value, 'name' : name, 'peers': [{'name' : peer[0], 'ip': peer[1], 'p_port': peer[2]} for peer in dhtpeers]}
 
 def dht_complete(name : str):
     """
@@ -78,41 +101,57 @@ def dht_complete(name : str):
     
     :returns: whether or not the dht was constructed correctly
     """
-    
-    return returnCodes.SUCCESS if peers[name].state == State.LEADER else returnCodes.FAILURE
+    if name in peers and peers[name].state == PeerState.LEADER:
+        state['dht'] = DHTState.COMPLETE
 
+        
+        return {'status' : returnCodes.SUCCESS.value}
 
+    else:
+        return {'status' : returnCodes.FAILURE.value}
+ 
 while(running):
-    
+    logger.info("current registry state: %s", peers )
     data, addr = sock.recvfrom(1024) # data comes in a space delimited string of the fields minus the address
     
-    data_split = data.decode().split(" ")
-    cmd = data_split[0]
-    args = data_split[1:]
+    data_split = json.loads(data.decode())
+    cmd = data_split['cmd']
+    args = data_split['args']
     
-    logger.info("received command %s from address %s with args %s", cmd, addr, args)
-    res = returnCodes.FAILURE
+    logger.info("received command %s from address %s", data_split['cmd'], addr)
+    res = {'status' : returnCodes.INVALID.value}
     
-    match(cmd):
-        case "register":
-            if len(args != 4):
-                break
-            res = registerPeer(args[0], args[1], args[2], args[3])
-            break
-        case "setup_dht":
-            if len(args != 3):
-                break
-            res = setup_dht(args[0], args[1], args[2])
-            break
-        case "dht_complete":
-            if len(args != 3):
-                break
-            res = dht_complete(args[0])
-            break
-        case _:
-            res = returnCodes.INVALID
-            logger.info("received command %s is invalid!", cmd)
-    sock.sendto(res.value, addr)
+    if state['dht'] == DHTState.CONSTRUCTING and cmd != "dht-complete":
+        res =  {'status' : returnCodes.FAILURE.value}
+        sock.sendto(json.dumps(res).encode(), addr)
+        continue
+    try:
+        match(cmd):
+            case "register":
+                if len(args) != 4:
+                    res = {'status' : returnCodes.INVALID.value}
+                    
+                else:
+                    res = registerPeer(args[0], args[1], args[2], args[3])
+                
+            case "setup-dht":
+                if len(args) != 3:
+                    res = {'status' : returnCodes.INVALID.value}
+                else:
+                    res = setup_dht(args[0], int(args[1]), args[2])
+            case "dht-complete":
+                if len(args) != 1:
+                    res = {'status' : returnCodes.INVALID.value}
+                else:
+                    res = dht_complete(args[0])
+                
+            case _:
+                res = {'status' : returnCodes.INVALID.value}
+                logger.info("received command %s is invalid!", cmd)
+    except (KeyError, ValueError, IndexError) as e:
+        logger.error("unexpected error: %s", e)
+    res['cmd'] = cmd
+    sock.sendto(json.dumps(res).encode(), addr)
 
 
 
