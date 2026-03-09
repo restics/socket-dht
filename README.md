@@ -1,1 +1,4 @@
-i did not like working on this project
+## distributed hash table using sockets
+
+i hate everything but i hate python more
+
