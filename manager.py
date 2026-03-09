@@ -91,7 +91,7 @@ def setup_dht(name : str, size : int, year : str):
         dhtpeers.append((peer.name, peer.address, peer.p_port))
     
     state['dht'] = DHTState.CONSTRUCTING
-    return{'status' : returnCodes.SUCCESS.value, 'name' : name, 'peers': [{'name' : peer[0], 'ip': peer[1], 'p_port': peer[2]} for peer in dhtpeers]}
+    return{'status' : returnCodes.SUCCESS.value, 'name' : name, 'year': year, 'peers': [{'name' : peer[0], 'ip': peer[1], 'p_port': peer[2]} for peer in dhtpeers]}
 
 def dht_complete(name : str):
     """
@@ -103,8 +103,8 @@ def dht_complete(name : str):
     """
     if name in peers and peers[name].state == PeerState.LEADER:
         state['dht'] = DHTState.COMPLETE
+        logger.info('dht construction complete. peers in dht: %s', dhtpeers)
 
-        
         return {'status' : returnCodes.SUCCESS.value}
 
     else:
@@ -121,7 +121,7 @@ while(running):
     logger.info("received command %s from address %s", data_split['cmd'], addr)
     res = {'status' : returnCodes.INVALID.value}
     
-    if state['dht'] == DHTState.CONSTRUCTING and cmd != "dht-complete":
+    if state['dht'] == DHTState.CONSTRUCTING and cmd != "dht-complete": # ignore everything else while we construct
         res =  {'status' : returnCodes.FAILURE.value}
         sock.sendto(json.dumps(res).encode(), addr)
         continue
