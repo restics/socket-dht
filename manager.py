@@ -9,6 +9,8 @@ import json
 import random
 import sys
 
+
+
 class PeerState(Enum):
     FREE = 0 #  a peer able to participate in any capacity
     LEADER = 1 #  a peer that leads the construction of the DHT
@@ -18,6 +20,7 @@ class DHTState(Enum):
     UNINIT = 0
     CONSTRUCTING = 1
     COMPLETE = 2
+    TEARDOWN = 3
     
 class returnCodes(Enum):
     FAILURE = 'FAILURE'
@@ -34,9 +37,9 @@ class Peer:
     id: int
 
 peers: dict[str, Peer] = {}
-dhtpeers = []
+dhtpeers: list[Peer] = []
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
-IP = "127.0.0.1"
+IP = "0.0.0.0"
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((IP, PORT))
@@ -58,11 +61,10 @@ def registerPeer(name, ip, mport, pport):
     :returns: whether or not the registration was successful.
     
     """ 
-    logger.info("")
     if name in peers:
         return {'status' : returnCodes.FAILURE.value}
     peers[name] = Peer(name, ip, mport, pport, PeerState.FREE, -1)
-    return {'status' : returnCodes.SUCCESS.value}
+    return {'status' : returnCodes.SUCCESS.value, 'ip' : ip, 'name' : name}
     
 def setup_dht(name : str, size : int, year : str):
     """
@@ -109,19 +111,104 @@ def dht_complete(name : str):
 
     else:
         return {'status' : returnCodes.FAILURE.value}
+    
+def query_dht(peer_name : str, event_id : str): # event_id is not part of spec but it seems you're supposed to search for it so im adding it here.
+    """
+    Returns a random peer in the dht
+    
+    :param peer_name: a str name of the peer to return the results to
+    :param event_id: a str name of the 
+    :returns: a 3 tuple of information relating to the randomly selected peer
+    """
+    if peer_name not in peers or state['dht'] == DHTState.UNINIT or peers[peer_name].state != PeerState.FREE:
+        reason = "Unknown" # idk this should never be shown logically
+        
+        if peer_name not in peers:
+            reason = "peer not registered!"
+        elif state['dht'] == DHTState.UNINIT:
+            reason = "DHT not initialized!"
+        logger.info('querydht failed! reason: %s', reason)
+        return {'status' : returnCodes.FAILURE.value}
+
+
+    random_peer = random.sample(dhtpeers,1)[0]
+    return {'status' : returnCodes.SUCCESS.value, 'sender_name': peer_name, 'event_id': event_id, 'name' : random_peer[0], 'address' : random_peer[1], 'p_port': random_peer[2]}
+
+
+def leave_dht(peer_name : str): 
+    """
+    Initiates the process of letting the mentioned peer leave
+    
+    :param peer_name: name of the peer trying to leave
+    """
+    if peer_name not in peers or state['dht'] == DHTState.UNINIT or peers[peer_name].state == PeerState.FREE:
+        reason = "Unknown" # idk this should never be shown logically
+        
+        if peer_name not in peers:
+            reason = "peer not registered!"
+        elif state['dht'] == DHTState.UNINIT:
+            reason = "DHT not initialized!"
+        logger.info('leave_dht failed! reason: %s', reason)
+        return {'status' : returnCodes.FAILURE.value}
+
+    return {'status' : returnCodes.SUCCESS.value}
+
+
+def teardown_dht(peer_name : str): 
+    """
+    Initiates the process of tearing down dht
+    
+    :param peer_name: name of the dht leader
+    """
+    if peer_name not in peers or state['dht'] == DHTState.UNINIT or peers[peer_name].state != PeerState.LEADER:
+        reason = "Unknown" # idk this should never be shown logically
+        
+        if peer_name not in peers:
+            reason = "peer not registered!"
+        elif state['dht'] == DHTState.UNINIT:
+            reason = "DHT not initialized!"
+        logger.info('leave_dht failed! reason: %s', reason)
+        return {'status' : returnCodes.FAILURE.value}
+    state['dht'] = DHTState.TEARDOWN
+    return {'status' : returnCodes.SUCCESS.value}
+
+def teardown_complete(peer_name : str): 
+    """
+    Teardown signaled as complete, just wrap things up
+    
+    :param peer_name: name of the dht leader
+    """
+    if peer_name not in peers or state['dht'] == DHTState.UNINIT or peers[peer_name].state != PeerState.LEADER:
+        reason = "Unknown" # idk this should never be shown logically
+        
+        if peer_name not in peers:
+            reason = "peer not registered!"
+        elif state['dht'] == DHTState.UNINIT:
+            reason = "DHT not initialized!"
+        logger.info('leave_dht failed! reason: %s', reason)
+        return {'status' : returnCodes.FAILURE.value}
+
+    for peer in dhtpeers:
+        peer_name = peer[0]
+        peers[peer_name].state = PeerState.FREE
+        peers[peer_name].id = -1
+    return {'status' : returnCodes.SUCCESS.value}
  
 while(running):
     logger.info("current registry state: %s", peers )
-    data, addr = sock.recvfrom(1024) # data comes in a space delimited string of the fields minus the address
+    data, addr = sock.recvfrom(1024) 
     
     data_split = json.loads(data.decode())
     cmd = data_split['cmd']
-    args = data_split['args']
-    
+    args = data_split['args'] 
     logger.info("received command %s from address %s", data_split['cmd'], addr)
     res = {'status' : returnCodes.INVALID.value}
     
     if state['dht'] == DHTState.CONSTRUCTING and cmd != "dht-complete": # ignore everything else while we construct
+        res =  {'status' : returnCodes.FAILURE.value}
+        sock.sendto(json.dumps(res).encode(), addr)
+        continue
+    elif state['dht'] == DHTState.TEARDOWN and cmd != "teardown-complete": # ignore everything else while we teardown
         res =  {'status' : returnCodes.FAILURE.value}
         sock.sendto(json.dumps(res).encode(), addr)
         continue
@@ -144,6 +231,11 @@ while(running):
                     res = {'status' : returnCodes.INVALID.value}
                 else:
                     res = dht_complete(args[0])
+            case "query-dht":
+                if len(args) != 2:
+                    res = {'status' : returnCodes.INVALID.value}
+                else:
+                    res = query_dht(args[0],args[1])
                 
             case _:
                 res = {'status' : returnCodes.INVALID.value}
