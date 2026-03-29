@@ -167,8 +167,11 @@ def teardown_dht(peer_name : str):
             reason = "peer not registered!"
         elif state['dht'] == DHTState.UNINIT:
             reason = "DHT not initialized!"
+        elif peers[peer_name].state != PeerState.LEADER:
+            reason = "Peer is not leader!"
         logger.info('leave_dht failed! reason: %s', reason)
         return {'status' : returnCodes.FAILURE.value}
+    
     state['dht'] = DHTState.TEARDOWN
     return {'status' : returnCodes.SUCCESS.value}
 
@@ -185,6 +188,8 @@ def teardown_complete(peer_name : str):
             reason = "peer not registered!"
         elif state['dht'] == DHTState.UNINIT:
             reason = "DHT not initialized!"
+        elif peers[peer_name].state != PeerState.LEADER:
+            reason = "Peer is not leader!"
         logger.info('leave_dht failed! reason: %s', reason)
         return {'status' : returnCodes.FAILURE.value}
 
@@ -192,6 +197,8 @@ def teardown_complete(peer_name : str):
         peer_name = peer[0]
         peers[peer_name].state = PeerState.FREE
         peers[peer_name].id = -1
+    state['dht'] = DHTState.UNINIT
+    dhtpeers.clear()
     return {'status' : returnCodes.SUCCESS.value}
  
 while(running):
@@ -236,7 +243,23 @@ while(running):
                     res = {'status' : returnCodes.INVALID.value}
                 else:
                     res = query_dht(args[0],args[1])
-                
+            case "leave-dht":
+                if len(args) != 1:
+                    res = {'status': returnCodes.INVALID.value}
+                else:
+                    res = leave_dht(args[0])
+            case "teardown-dht":
+                if len(args) != 1:
+                    res = {'status': returnCodes.INVALID.value}
+                else:
+                    res = teardown_dht(args[0])
+            case "teardown-complete":
+
+                if len(args) != 1:
+                    res = {'status': returnCodes.INVALID.value}
+                else:
+                    res = teardown_dht(args[0])
+
             case _:
                 res = {'status' : returnCodes.INVALID.value}
                 logger.info("received command %s is invalid!", cmd)
