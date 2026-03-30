@@ -21,6 +21,7 @@ class DHTState(Enum):
     CONSTRUCTING = 1
     COMPLETE = 2
     TEARDOWN = 3
+    REBUILDING = 4 # for both leave/join
     
 class returnCodes(Enum):
     FAILURE = 'FAILURE'
@@ -150,9 +151,95 @@ def leave_dht(peer_name : str):
             reason = "DHT not initialized!"
         logger.info('leave_dht failed! reason: %s', reason)
         return {'status' : returnCodes.FAILURE.value}
-
+    state['dht'] = DHTState.REBUILDING
+    state['leaving_peer'] = peer_name
+    logger.info('initializing leave of %s of dht', peer_name)
     return {'status' : returnCodes.SUCCESS.value}
+def join_dht(peer_name : str): 
+    """
+    Initiates the process of letting the mentioned peer leave
+    
+    :param peer_name: name of the peer trying to leave
+    """
+    if peer_name not in peers or state['dht'] == DHTState.UNINIT or peers[peer_name].state != PeerState.FREE:
+        reason = "Unknown" # idk this should never be shown logically
+        
+        if peer_name not in peers:
+            reason = "peer not registered!"
+        elif state['dht'] == DHTState.UNINIT:
+            reason = "DHT not initialized!"
+        logger.info('join_dht failed! reason: %s', reason)
+        return {'status' : returnCodes.FAILURE.value}
+    
+    state['dht'] = DHTState.REBUILDING
+    state['joining_peer'] = peer_name
+    leader_peer = next((p for p in peers.values() if p.state == PeerState.LEADER), None)
+    if leader_peer is None:
+        return {'status' : returnCodes.FAILURE.value}
+    logger.info('initializing join of %s of dht', peer_name)
+    return {'status' : returnCodes.SUCCESS.value, 'leader_info' : {'name' : leader_peer.name, 'ip': leader_peer.address, 'p_port': leader_peer.p_port}}
 
+def dht_rebuilt(peer_name: str, new_leader: str, newpeers: list[dict]):
+    """
+    Signals that the dht has finished rebuild after a leave/join
+    
+    :param peer_name: name of the peer that initiated the leave/join
+    :param new_leader: name of the new leader of the rebuilt dht
+    """
+    if peer_name not in peers or new_leader not in peers or state['dht'] != DHTState.REBUILDING:
+        reason = "Unknown" # idk this should never be shown logically
+        
+        if peer_name not in peers or new_leader not in peers:
+            reason = "peer/new leader not registered!"
+        elif state['dht'] != DHTState.REBUILDING:
+            reason = "DHT not in rebuilding state!"
+        logger.info('dht_rebuilt failed! reason: %s', reason)
+        return {'status' : returnCodes.FAILURE.value}
+
+    if 'leaving_peer' in state:
+        dhtpeers.pop(peers[peer_name].id)
+        peers[peer_name].id = -1
+        peers[peer_name].state = PeerState.FREE
+        state.pop('leaving_peer')
+        for i, peer in enumerate(newpeers): # we saved these in order by design
+            peers[peer['name']].id = i
+            peers[peer['name']].state = PeerState.INDHT
+            state['dht'] = DHTState.COMPLETE
+        
+        peers[new_leader].id = 0
+        peers[new_leader].state = PeerState.LEADER
+    elif 'joining_peer' in state:
+
+        peers[peer_name].state = PeerState.INDHT
+        dhtpeers.append((peers[peer_name].name, peers[peer_name].address, peers[peer_name].p_port))
+        state.pop('joining_peer')
+        for i, peer in enumerate(newpeers):
+            peers[peer['name']].id = i
+            peers[peer['name']].state = PeerState.INDHT
+        peers[new_leader].id = 0
+        peers[new_leader].state = PeerState.LEADER
+        state['dht'] = DHTState.COMPLETE
+    else:
+        return {'status' : returnCodes.FAILURE.value}
+    return {'status' : returnCodes.SUCCESS.value}
+def deregister(peer_name : str): 
+    """
+    Deregisters a peer from the DHT
+    
+    :param peer_name: name of the peer trying to deregister
+    """
+    if peer_name not in peers or peers[peer_name].state != PeerState.FREE:
+        reason = "Unknown" # idk this should never be shown logically
+        
+        if peer_name not in peers:
+            reason = "peer not registered!"
+        logger.info('leave_dht failed! reason: %s', reason)
+        return {'status' : returnCodes.FAILURE.value}
+
+
+    logger.info('%s deregistered.', peer_name)
+    peers.pop(peer_name)
+    return {'status' : returnCodes.SUCCESS.value}
 
 def teardown_dht(peer_name : str): 
     """
@@ -169,10 +256,12 @@ def teardown_dht(peer_name : str):
             reason = "DHT not initialized!"
         elif peers[peer_name].state != PeerState.LEADER:
             reason = "Peer is not leader!"
-        logger.info('leave_dht failed! reason: %s', reason)
+        logger.info('teardown_dht failed! reason: %s', reason)
         return {'status' : returnCodes.FAILURE.value}
     
     state['dht'] = DHTState.TEARDOWN
+    
+    logger.info('initializing teardown of dht')
     return {'status' : returnCodes.SUCCESS.value}
 
 def teardown_complete(peer_name : str): 
@@ -181,16 +270,16 @@ def teardown_complete(peer_name : str):
     
     :param peer_name: name of the dht leader
     """
-    if peer_name not in peers or state['dht'] == DHTState.UNINIT or peers[peer_name].state != PeerState.LEADER:
+    if peer_name not in peers or state['dht'] != DHTState.TEARDOWN or peers[peer_name].state != PeerState.LEADER:
         reason = "Unknown" # idk this should never be shown logically
         
         if peer_name not in peers:
             reason = "peer not registered!"
-        elif state['dht'] == DHTState.UNINIT:
-            reason = "DHT not initialized!"
+        elif state['dht'] == DHTState.TEARDOWN:
+            reason = "DHT not in teardown mode!"
         elif peers[peer_name].state != PeerState.LEADER:
             reason = "Peer is not leader!"
-        logger.info('leave_dht failed! reason: %s', reason)
+        logger.info('teardown_complete failed! reason: %s', reason)
         return {'status' : returnCodes.FAILURE.value}
 
     for peer in dhtpeers:
@@ -199,6 +288,7 @@ def teardown_complete(peer_name : str):
         peers[peer_name].id = -1
     state['dht'] = DHTState.UNINIT
     dhtpeers.clear()
+    logger.info('dht successfully deleted! ')
     return {'status' : returnCodes.SUCCESS.value}
  
 while(running):
@@ -216,6 +306,10 @@ while(running):
         sock.sendto(json.dumps(res).encode(), addr)
         continue
     elif state['dht'] == DHTState.TEARDOWN and cmd != "teardown-complete": # ignore everything else while we teardown
+        res =  {'status' : returnCodes.FAILURE.value}
+        sock.sendto(json.dumps(res).encode(), addr)
+        continue
+    elif state['dht'] == DHTState.REBUILDING and cmd != "dht-rebuilt": # ignore everything else while we rebuild
         res =  {'status' : returnCodes.FAILURE.value}
         sock.sendto(json.dumps(res).encode(), addr)
         continue
@@ -248,6 +342,21 @@ while(running):
                     res = {'status': returnCodes.INVALID.value}
                 else:
                     res = leave_dht(args[0])
+            case "join-dht":
+                if len(args) != 1:
+                    res = {'status': returnCodes.INVALID.value}
+                else:
+                    res = join_dht(args[0])
+            case "dht-rebuilt":
+                if len(args) != 3:
+                    res = {'status': returnCodes.INVALID.value}
+                else:
+                    res = dht_rebuilt(args[0], args[1], args[2])
+            case "deregister":
+                if len(args) != 1:
+                    res = {'status': returnCodes.INVALID.value}
+                else:
+                    res = deregister(args[0])
             case "teardown-dht":
                 if len(args) != 1:
                     res = {'status': returnCodes.INVALID.value}
@@ -258,7 +367,7 @@ while(running):
                 if len(args) != 1:
                     res = {'status': returnCodes.INVALID.value}
                 else:
-                    res = teardown_dht(args[0])
+                    res = teardown_complete(args[0])
 
             case _:
                 res = {'status' : returnCodes.INVALID.value}

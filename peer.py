@@ -8,12 +8,14 @@ import select, sys
 import csv
 import time
 import random
+from enum import Enum
 
 manager_ip = sys.argv[1]
 manager_port = int(sys.argv[2])
 m_port = int(sys.argv[3])
 p_port = int(sys.argv[4])
 name = ""
+year = "1996"
 my_ip = '0.0.0.0'
 
 s = 1
@@ -22,6 +24,16 @@ table_data = {}
 ring_id = -1 # default if not part of ring
 right_neighbor = None
 
+class RebuildState(Enum):
+    NONE = 0 # not rebuilding/ not the leave/joiner
+    TEARDOWN = 1 # in teardown state
+    IDRESET = 2 # in idreset state
+    REBUILDDHT = 3 # in rebuild state
+    JOIN_TEARDOWN = 4
+    
+join_peer_info = None 
+
+rebuildstate = {'state' : RebuildState.NONE}
 m_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 m_sock.bind(("0.0.0.0", m_port))
 
@@ -82,7 +94,58 @@ def find_event(sender_name, event_id, id_seq, sender_ip, sender_p_port):
     req = {'cmd': 'find-event', 'sender_name': sender_name, 'event_id': event_id, 'id_seq' : id_seq,'sender_ip': sender_ip, 'sender_p_port': sender_p_port }
     p_sock.sendto(json.dumps(req).encode(), (dhtpeers[next_peer_id]['ip'], int(dhtpeers[next_peer_id]['p_port'])))
         
+def build_dht(peers, year = 1996):
+    global right_neighbor, ring_id, dhtpeers, s, table_data
+    
+    ring_id = 0 # you are the leader
+    size = len(peers)
+    dhtpeers = peers
+    with open(f'details-{year}.csv', 'r') as csvfile:
+
+        nodecounter = [0 for _ in range(size)] 
+        datareader = csv.DictReader(csvfile)
+        rows = list(datareader)
+    s = next_prime(2*len(rows))
+    
+    for i, peer in enumerate(peers):
+        if peer['p_port'] == str(p_port): 
+            continue
+        req = {'cmd': 'set-id', 'id': i, 'size' : size, 'peers' : peers, 's' : s, 'year': year}
+        p_sock.sendto(json.dumps(req).encode(), (peer['ip'], int(peer['p_port'])))
+
+        addr = f"{peer['ip']}:{peer['p_port']}"
+        logger.info('sent %s to %s', req, addr)
+
+    right_neighbor = peers[1]
+    logger.info('ring complete, populating dht...')
+
+    for row in rows:
+
+        pos = int(row['EVENT_ID']) % s
+        dest_id = pos % size
+        nodecounter[dest_id] += 1
+        if dest_id == ring_id:
+            if pos in table_data:
+                existing = table_data[pos]
+                logger.info('collision at pos %s: existing EVENT_IDS=%s, new EVENT_ID=%s', pos, [event['EVENT_ID'] for event in existing], row['EVENT_ID'])
+            else:
+                table_data[pos] = []
+            table_data[pos].append(row)
+            logger.info('hash valid for leader, storing...')
+        else:
+            logger.info('directing hash (pos: %s,dest_id %s) to the right neighbor...', pos, dest_id)
+            req = {'cmd': 'store', 'pos': pos, 'dest_id' : dest_id, 'data' : row}
+            p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
+            time.sleep(0.002) # prevent buffer overflow
+
+    logger.info('%s total entries', len(rows))
+    for i, n in enumerate(nodecounter):
+        logger.info('%s entries stored at ring id: %s', n, i)
         
+        
+def clear_data():
+    pass
+
 while (active):
     
     readable, _, _ = select.select([sys.stdin, m_sock, p_sock], [], [], 0.5)
@@ -108,55 +171,9 @@ while (active):
                     my_ip = response['ip']
                     name = response['name']
                 case 'setup-dht':
-                    name = response['name']
                     peers = response['peers']
                     year = response['year']
-                    ring_id = 0 # you are the leader
-                    size = len(peers)
-                    dhtpeers = peers
-                    with open(f'details-{year}.csv', 'r') as csvfile:
-
-                        nodecounter = [0 for _ in range(size)] 
-                        datareader = csv.DictReader(csvfile)
-                        rows = list(datareader)
-                    s = next_prime(2*len(rows))
-                    
-                    for i, peer in enumerate(peers):
-                        if peer['p_port'] == str(p_port): 
-                            continue
-                        req = {'cmd': 'set-id', 'id': i, 'size' : size, 'peers' : peers, 's' : s}
-                        p_sock.sendto(json.dumps(req).encode(), (peer['ip'], int(peer['p_port'])))
-
-                        addr = f"{peer['ip']}:{peer['p_port']}"
-                        logger.info('sent %s to %s', req, addr)
-
-                    right_neighbor = peers[1]
-                    logger.info('ring complete, populating dht...')
-
-
-                    
-                    for row in rows:
-
-                        pos = int(row['EVENT_ID']) % s
-                        dest_id = pos % size
-                        nodecounter[dest_id] += 1
-                        if dest_id == ring_id:
-                            if pos in table_data:
-                                existing = table_data[pos]
-                                logger.info('collision at pos %s: existing EVENT_IDS=%s, new EVENT_ID=%s', pos, [event['EVENT_ID'] for event in existing], row['EVENT_ID'])
-                            else:
-                                table_data[pos] = []
-                            table_data[pos].append(row)
-                            logger.info('hash valid for leader, storing...')
-                        else:
-                            logger.info('directing hash (pos: %s,dest_id %s) to the right neighbor...', pos, dest_id)
-                            req = {'cmd': 'store', 'pos': pos, 'dest_id' : dest_id, 'data' : row}
-                            p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
-                            time.sleep(0.002) # prevent buffer overflow
-
-                    logger.info('%s total entries', len(rows))
-                    for i, n in enumerate(nodecounter):
-                        logger.info('%s entries stored at ring id: %s', n, i)
+                    build_dht(peers, year)
                     logger.info('dht construction complete, signaling manager!')
                     m_sock.sendto(json.dumps({'cmd' : 'dht-complete', 'args' : [name]}).encode(), (manager_ip, manager_port))
                 case 'query-dht':
@@ -170,8 +187,28 @@ while (active):
                     p_sock.sendto(json.dumps(req).encode(), (search_addr,int(search_port)))
                 
                 case 'teardown-dht':
-                    
-                    
+                    logger.info('teardown init. forwarding teardown to right neighbor')
+                    req = {'cmd': 'teardown', 'start_name' : name}
+                    p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
+                case 'leave-dht':
+                    logger.info('leave init. 1. forwarding teardown to right neighbor')
+                    req = {'cmd': 'teardown', 'start_name' : name}
+                    rebuildstate['state'] = RebuildState.TEARDOWN
+                    p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
+                case 'join-dht':
+                    logger.info('join init. 1. forwarding teardown to right neighbor')
+                    leader_info = response['leader_info']  
+                    req = {'cmd': 'join-ring', 'name': name, 'ip': my_ip, 'p_port': str(p_port)}
+                    p_sock.sendto(json.dumps(req).encode(), (leader_info['ip'], int(leader_info['p_port'])))
+                
+                
+
+                case 'deregister':
+                    if response['status'] == 'SUCCESS':
+                        logger.info('deregistration successful, terminating.')
+                        sys.exit()
+                    else:
+                        logger.info('deregistration failed!')
                     
         elif source == p_sock:
             data, addr = p_sock.recvfrom(4096)
@@ -186,6 +223,7 @@ while (active):
                    right_neighbor = response['peers'][(ring_id + 1) % response['size']]
                    dhtpeers = response['peers']
                    s = response['s']
+                   year = response.get('year', year)
                 case 'store':     
                     dest_id = response['dest_id']
                     pos = response['pos']
@@ -219,9 +257,72 @@ while (active):
                 case 'teardown':
                     start_name = response['start_name']
                     table_data = {}
+                    
                     if name != start_name:
-                        logger.info("Tearing down dht, clearing hash table and passing message along.")
+                        logger.info("Tearing down dht, clearing hash table and passing message along")
                         req = {'cmd': 'teardown', 'start_name' : start_name}
-                        p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
+                        right_ip = right_neighbor['ip']
+                        port = int(right_neighbor['p_port'])
+                        dhtpeers = []
+                        p_sock.sendto(json.dumps(req).encode(), (right_ip, port))
+                    elif rebuildstate['state'] == RebuildState.JOIN_TEARDOWN:
+                        logger.info("join (1/3) complete, starting rebuild")
+                        joiner = join_peer_info
+                        my_entry = {'name': name, 'ip': my_ip, 'p_port': str(p_port)}
+                        others = [p for p in dhtpeers if p['p_port'] != str(p_port)]
+                        new_peers = [my_entry] + others + [joiner]
+                        build_dht(new_peers, year)
+                        rebuildstate['state'] = RebuildState.NONE
+                        join_peer_info = None
+                        req = {'cmd': 'join-complete', 'new_leader': name}
+                        p_sock.sendto(json.dumps(req).encode(), (joiner['ip'], int(joiner['p_port'])))
                     else:
-                        logger.info("Teardown complete")
+                        if rebuildstate['state'] == RebuildState.TEARDOWN: # teardown was started for leaving purposes
+                            logger.info("leave (1/3) complete, starting id resets!")
+                            
+                            
+                            rebuildstate['state'] = RebuildState.IDRESET
+                            
+                            right_ip = right_neighbor['ip']
+                            port = int(right_neighbor['p_port'])
+                            size = len(dhtpeers) - 1
+                            dhtpeers.pop(ring_id)
+                            ring_id = -1
+                            req = {'cmd': 'reset-id', 'newid': 0, 'peerlist' : []}
+                            p_sock.sendto(json.dumps(req).encode(), (right_ip, port))
+                        else:
+                            
+                            logger.info("Teardown complete, clearing hash table")
+                            dhtpeers = []
+                            m_sock.sendto(json.dumps({'cmd' : 'teardown-complete', 'args' : [name]}).encode(), (manager_ip, manager_port))
+ 
+                case 'reset-id':
+                    newid = response['newid']
+                    
+                    peerlist = response['peerlist']
+                    if rebuildstate['state'] == RebuildState.NONE: # not the removed peer
+                        ring_id = newid
+                        dhtpeers=peerlist
+                        peerlist.append({'name': name, 'ip': my_ip, 'p_port': str(p_port)})
+                        req = {'cmd': 'reset-id', 'newid': newid + 1, 'peerlist' : peerlist}
+                        p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
+                    else: # is the removed peer
+                        logger.info('leave (2/3) complete, starting rebuild!')
+                        req = {'cmd': 'rebuild-dht', 'removed_peer' : name, 'peers' : peerlist}
+                        p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
+                        
+                case 'rebuild-dht':
+                    logger.info('rebuilding dht using this peer as the new leader...')
+                    peers = response['peers']
+                    removed_peer = response['removed_peer']
+                    build_dht(peers, year)
+                    logger.info('dht rebuild complete, signaling manager!')
+                    m_sock.sendto(json.dumps({'cmd' : 'dht-rebuilt', 'args' : [removed_peer,name,peers]}).encode(), (manager_ip, manager_port))
+                case 'join-ring':
+                    join_peer_info = {'name': response['name'], 'ip': response['ip'], 'p_port': response['p_port']}
+                    rebuildstate['state'] = RebuildState.JOIN_TEARDOWN
+                    req = {'cmd': 'teardown', 'start_name': name}
+                    p_sock.sendto(json.dumps(req).encode(), (right_neighbor['ip'], int(right_neighbor['p_port'])))
+                case 'join-complete':
+                    new_leader = response['new_leader']
+                    m_sock.sendto(json.dumps({'cmd': 'dht-rebuilt', 'args': [name, new_leader, dhtpeers]}).encode(), (manager_ip, manager_port))
