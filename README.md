@@ -1,4 +1,4 @@
 ## distributed hash table using sockets
 
-i hate everything but i hate python more
+i thought i loved python until i worked on this project
 
